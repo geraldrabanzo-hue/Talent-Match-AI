@@ -1,0 +1,6 @@
+{
+  "name": "AI Talent Matcher",
+  "description": "Intelligent candidate-to-role matching using semantic AI analysis and CV parsing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
