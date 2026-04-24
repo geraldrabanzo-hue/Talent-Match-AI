@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useCallback, useRef } from 
 import { toast } from 'sonner';
 import { extractCVData } from '../lib/gemini';
 import { extractTextFromFile } from '../lib/parser';
+import { supabase } from '../lib/supabase';
 
 interface UploadTask {
   id: string;
@@ -38,7 +39,7 @@ export const UploadProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const startUpload = useCallback(async (files: File[]) => {
     const uploadId = Math.random().toString(36).substring(7);
     cancelRef.current = false;
-    
+
     setActiveUpload({
       id: uploadId,
       files,
@@ -49,68 +50,79 @@ export const UploadProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     });
 
     let completed = 0;
-    
-    // Process one by one for maximum reliability
-    const batchSize = 1;
-    for (let i = 0; i < files.length; i += batchSize) {
+
+    for (let i = 0; i < files.length; i++) {
       if (cancelRef.current) break;
 
-      const batch = files.slice(i, i + batchSize);
-      await Promise.all(batch.map(async (file) => {
+      const file = files[i];
+
+      try {
+        // 1. Upload file to Supabase Storage
+        const fileName = `${Date.now()}-${file.name}`;
+
+        const { error: uploadError } = await supabase.storage
+          .from('cvs')
+          .upload(fileName, file);
+
+        if (uploadError) {
+          console.error(uploadError);
+          toast.error(`Upload failed: ${file.name}`);
+          continue;
+        }
+
+        const { data } = supabase.storage
+          .from('cvs')
+          .getPublicUrl(fileName);
+
+        const fileUrl = data.publicUrl;
+
+        // 2. Extract text (for AI only)
+        const text = await extractTextFromFile(file);
         if (cancelRef.current) return;
 
-        try {
-          // Step 1: Parse Text
-          const text = await extractTextFromFile(file);
-          if (cancelRef.current) return;
-          
-          // Step 2: AI Extract metadata
-          // Note: We save extracted text instead of Base64 file data.
-          // This avoids Vercel payload limits during uploads.
-          const extractedData = await extractCVData(text);
-          if (cancelRef.current) return;
-          
-          const newCandidate = {
-            ...extractedData,
-            cvText: text,
-            cvUrl: "",
-            fileType: "TXT"
-          };
-          
-          // Ensure we have at least an empty string for email if missing
-          if (!newCandidate.email) newCandidate.email = "";
+        // 3. AI processing
+        const extractedData = await extractCVData(text);
+        if (cancelRef.current) return;
 
-          // Step 3: Save to Supabase-backed API
-          await fetch("/api/candidates", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(newCandidate)
-          });
+        const newCandidate = {
+          ...extractedData,
+          cvText: text,
+          file_url: fileUrl,
+          fileType: file.type
+        };
 
-          completed++;
-          setActiveUpload(prev => prev ? {
-            ...prev,
-            completedFiles: Math.min(completed, files.length),
-            progress: (completed / files.length) * 100
-          } : null);
-        } catch (error) {
-          console.error(`Failed to process ${file.name}`, error);
-          toast.error(`Error processing ${file.name}. High AI demand.`);
-        }
-      }));
+        if (!newCandidate.email) newCandidate.email = "";
 
-      // Small delay between items to respect rate limits
-      if (i + batchSize < files.length) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        // 4. Save to DB via API
+        await fetch("/api/candidates", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newCandidate)
+        });
+
+        completed++;
+
+        setActiveUpload(prev => prev ? {
+          ...prev,
+          completedFiles: Math.min(completed, files.length),
+          progress: (completed / files.length) * 100
+        } : null);
+
+      } catch (error) {
+        console.error(`Failed to process ${file.name}`, error);
+        toast.error(`Error processing ${file.name}`);
       }
+
+      // delay to avoid rate limits
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     if (!cancelRef.current) {
-      toast.success(`Successfully added ${completed} candidates to the library`);
+      toast.success(`Successfully added ${completed} candidates`);
     } else {
-      toast.info(`Upload stopped manually. ${completed} records saved.`);
+      toast.info(`Upload stopped. ${completed} saved.`);
     }
-    
+
     triggerCompletion();
     setActiveUpload(null);
   }, [triggerCompletion]);
